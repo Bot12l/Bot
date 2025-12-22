@@ -1,0 +1,2 @@
+>> RUN: collectFreshMints maxCollect=1 timeoutMs=60000
+No fresh mints found within timeout

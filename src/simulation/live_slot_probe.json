@@ -1,0 +1,110 @@
+{
+  "mint": "DudpgjYtyDRn9DLCdQVcamnRZQD1VVFyAGW5swpL9Prn",
+  "firstSignature": "4CmvNHx8vhGWBcbHArypzBAV9qdB8RyZzCKh3YMpNAxCJUPGbGdmpX4NNYFNjWs5Zz9w2BRTuz7qZKaiZYq9kmNY",
+  "firstSlot": 388308080,
+  "slotScans": [
+    {
+      "slot": 388308070,
+      "entries": []
+    },
+    {
+      "slot": 388308071,
+      "entries": []
+    },
+    {
+      "slot": 388308072,
+      "entries": []
+    },
+    {
+      "slot": 388308073,
+      "entries": []
+    },
+    {
+      "slot": 388308074,
+      "entries": []
+    },
+    {
+      "slot": 388308075,
+      "entries": []
+    },
+    {
+      "slot": 388308076,
+      "entries": []
+    },
+    {
+      "slot": 388308077,
+      "entries": []
+    },
+    {
+      "slot": 388308078,
+      "entries": []
+    },
+    {
+      "slot": 388308079,
+      "entries": []
+    },
+    {
+      "slot": 388308080,
+      "entries": []
+    },
+    {
+      "slot": 388308081,
+      "entries": []
+    },
+    {
+      "slot": 388308082,
+      "entries": []
+    },
+    {
+      "slot": 388308083,
+      "entries": []
+    },
+    {
+      "slot": 388308084,
+      "entries": []
+    },
+    {
+      "slot": 388308085,
+      "entries": []
+    },
+    {
+      "slot": 388308086,
+      "entries": []
+    },
+    {
+      "slot": 388308087,
+      "entries": []
+    },
+    {
+      "slot": 388308088,
+      "entries": []
+    },
+    {
+      "slot": 388308089,
+      "entries": []
+    },
+    {
+      "slot": 388308090,
+      "entries": []
+    }
+  ],
+  "sequenceDetected": false,
+  "signatures": [
+    {
+      "signature": "4CmvNHx8vhGWBcbHArypzBAV9qdB8RyZzCKh3YMpNAxCJUPGbGdmpX4NNYFNjWs5Zz9w2BRTuz7qZKaiZYq9kmNY",
+      "slot": 388308080,
+      "err": null,
+      "memo": null,
+      "blockTime": 1766367834,
+      "confirmationStatus": "finalized"
+    },
+    {
+      "signature": "5sonQQ6LfhKJByn9G8NUahr866KvYxrP3sj8xeUqs6xZZuonWFk3BjkUdUFHnoEgvA7GXx2ueEkayoSPfzvtSArm",
+      "slot": 388308080,
+      "err": null,
+      "memo": null,
+      "blockTime": 1766367834,
+      "confirmationStatus": "finalized"
+    }
+  ]
+}
