@@ -52,8 +52,8 @@ export const JitoFeeEnum = {
 // Export pre-built Connection instances for convenience. Some modules expect both
 // a public connection and a private_connection for privileged calls.
 // Use rpcPool to obtain connections so the app benefits from rotation/backoff
-export const connection = rpcPool.getRpcConnection(RPC_URL);
-export const private_connection = rpcPool.getRpcConnection(PRIVATE_RPC_ENDPOINT || RPC_URL);
+export const connection = rpcPool.getRpcConnection({ preferUrl: RPC_URL });
+export const private_connection = rpcPool.getRpcConnection({ preferPrivate: true });
 
 export const getRpcPool = () => rpcPool;
 

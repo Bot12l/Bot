@@ -1,7 +1,8 @@
 // =================== Imports ===================
 import dotenv from 'dotenv';
 import { Telegraf, Markup } from 'telegraf';
-import { Fernet } from 'fernet';
+// fernet has an ambient d.ts in repo; use require to avoid TS module mismatch
+const { Fernet } = require('fernet');
 import Binance from 'binance-api-node';
 import axios from 'axios';
 import crypto from 'crypto';
@@ -14,21 +15,25 @@ import { autoExecuteStrategyForUser } from './src/autoStrategyExecutor';
 import { STRATEGY_FIELDS, buildTokenMessage, autoFilterTokens, notifyUsers, fetchDexScreenerTokens } from './src/utils/tokenUtils';
 import { generateKeypair, exportSecretKey, parseKey } from './src/wallet';
 
-console.log('--- Bot starting: Imports loaded ---');
+const DEBUG = !!process.env.DEBUG && process.env.DEBUG !== '0';
+function logt(...args: any[]) { if (DEBUG) console.log(...args); }
+function warnt(...args: any[]) { if (DEBUG) console.warn(...args); }
+
+logt('--- Bot starting: Imports loaded ---');
 
 dotenv.config();
 
-console.log('--- dotenv loaded ---');
+logt('--- dotenv loaded ---');
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_TOKEN);
+logt('TELEGRAM_BOT_TOKEN present:', !!TELEGRAM_TOKEN);
 if (!TELEGRAM_TOKEN) {
   console.error('TELEGRAM_BOT_TOKEN not found in .env file. Please add TELEGRAM_BOT_TOKEN=YOUR_TOKEN to .env');
   process.exit(1);
 }
 
 const bot = new Telegraf(TELEGRAM_TOKEN as string);
-console.log('--- Telegraf instance created ---');
+logt('--- Telegraf instance created ---');
 
 function escapeHtml(str: string){
   return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -129,7 +134,7 @@ function validateNotificationPayload(payload: any) {
   return { userId, chatId, tokens, html, inlineKeyboard, raw: payload };
 }
 let users: Record<string, any> = loadUsers();
-console.log('--- Users loaded ---');
+logt('--- Users loaded ---');
 
 // Sent-token hash helpers used by wsListener.ts — simple file-backed store
 import cryptoHash from 'crypto';
@@ -231,7 +236,7 @@ try { normalizeAllUserWallets(); } catch (e) { console.error('Failed to normaliz
 // --- Minimal crypto key storage (user-backed) ---
 const FERNET_KEY = process.env.FERNET_KEY || '';
 if (!FERNET_KEY) {
-  console.warn('FERNET_KEY not set in .env — keys will be stored as plain text unless you set FERNET_KEY.');
+  warnt('FERNET_KEY not set in .env — keys will be stored as plain text unless you set FERNET_KEY.');
 }
 const _fernet = FERNET_KEY ? new Fernet(FERNET_KEY) : null;
 function _maybeEncrypt(text: string) {
@@ -1927,11 +1932,11 @@ bot.action(/showtoken_sell_(.+)/, async (ctx) => {
       });
 
 // =================== Bot Launch ===================
-console.log('--- About to launch bot ---');
+logt('--- About to launch bot ---');
 (async () => {
   try {
     await bot.launch();
-    console.log('✅ Bot launched successfully (polling)');
+    logt('✅ Bot launched successfully (polling)');
   } catch (err: any) {
     if (err?.response?.error_code === 409) {
       console.error('❌ Bot launch failed: Conflict 409. Make sure the bot is not running elsewhere or stop all other sessions.');
@@ -1942,7 +1947,7 @@ console.log('--- About to launch bot ---');
     }
   }
 })();
-console.log('--- End of file reached ---');
+logt('--- End of file reached ---');
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection:', reason);

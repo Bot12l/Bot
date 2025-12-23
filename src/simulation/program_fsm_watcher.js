@@ -9,11 +9,14 @@ require('dotenv').config();
 const sniper = require('../../sniper.js');
 const EventEmitter = require('events');
 const sim = require('./sniper_simulator');
+const { LedgerSignalEngine, BIT_ACCOUNT_CREATED, BIT_ATA_CREATED, BIT_SAME_AUTH, BIT_PROGRAM_INIT, BIT_SLOT_DENSE, BIT_LP_STRUCT, BIT_CLEAN_FUNDING, BIT_SLOT_ALIGNED, BIT_CREATOR_EXPOSED } = require('./ledger_signal_engine');
+const metrics = require('./fsm_metrics_logger');
 const { struct, u32, u8 } = require('@solana/buffer-layout');
 const { bool, publicKey, u64 } = require('@solana/buffer-layout-utils');
 const { PublicKey } = require('@solana/web3.js');
 let connection = null;
 let cfg = null;
+let rpcPool = null;
 try{
   cfg = require('../config');
   connection = cfg && cfg.connection;
@@ -21,6 +24,7 @@ try{
   cfg = null;
   connection = null;
 }
+try{ rpcPool = require('../utils/rpcPool'); }catch(_e){ rpcPool = null; }
 
 // Bits: 0=mint_exists,1=authority_ok,2=pool_exists,3=pool_initialized
 // Added bits:
@@ -44,6 +48,40 @@ const WEIGHTS = {
   [BIT_TRANSFERABLE]: 0.20,
   [BIT_SLOT_SEQ]: 0.10,
 };
+// ledger-derived weights (small boosts for ledger signals)
+const LEDGER_WEIGHTS = {
+  [BIT_ACCOUNT_CREATED]: 0.06,
+  [BIT_ATA_CREATED]: 0.05,
+  [BIT_SAME_AUTH]: 0.04,
+  [BIT_PROGRAM_INIT]: 0.05,
+  [BIT_SLOT_DENSE]: 0.05,
+  [BIT_LP_STRUCT]: 0.07,
+  [BIT_CLEAN_FUNDING]: 0.08,
+  [BIT_SLOT_ALIGNED]: 0.06,
+  [BIT_CREATOR_EXPOSED]: 0.08,
+};
+
+// helper: decode ledger mask into names
+const LEDGER_BIT_NAMES = {
+  [BIT_ACCOUNT_CREATED]: 'AccountCreated',
+  [BIT_ATA_CREATED]: 'ATACreated',
+  [BIT_SAME_AUTH]: 'SameAuthority',
+  [BIT_PROGRAM_INIT]: 'ProgramInit',
+  [BIT_SLOT_DENSE]: 'SlotDensity',
+  [BIT_LP_STRUCT]: 'LPStruct',
+  [BIT_CLEAN_FUNDING]: 'CleanFunding',
+  [BIT_SLOT_ALIGNED]: 'SlotAligned',
+  [BIT_CREATOR_EXPOSED]: 'CreatorExposed',
+};
+function decodeLedgerMask(mask){
+  const out = [];
+  try{
+    for(const [bit, name] of Object.entries(LEDGER_BIT_NAMES)){
+      try{ if(mask & Number(bit)) out.push(name); }catch(_e){}
+    }
+  }catch(_e){}
+  return out;
+}
 const SCORE_THRESHOLD = (cfg && typeof cfg.READY_SCORE_THRESHOLD !== 'undefined') ? Number(cfg.READY_SCORE_THRESHOLD) : Number(process.env.READY_SCORE_THRESHOLD || 0.80);
 
 // Mint layout (same as src/raydium/types/mint.ts)
@@ -78,21 +116,25 @@ async function withRetries(fn){
   throw lastErr;
 }
 
-async function probeGetAccountInfo(pk){
+async function probeGetAccountInfo(pk, opts){
   try{
     const cached = accountCache.get(pk);
     if(cached && (Date.now() - cached.ts) < PROBE_TTL_MS) return cached.val;
-    const val = await withRetries(async ()=> await connection.getAccountInfo(new PublicKey(pk)).catch(()=>null));
+    const conn = (opts && opts.preferPrivate && rpcPool && typeof rpcPool.getRpcConnection === 'function') ? rpcPool.getRpcConnection({ preferPrivate: true }) : (connection || (rpcPool && rpcPool.getRpcConnection ? rpcPool.getRpcConnection() : null));
+    if(!conn) return null;
+    const val = await withRetries(async ()=> await conn.getAccountInfo(new PublicKey(pk)).catch(()=>null));
     accountCache.set(pk, { ts: Date.now(), val });
     return val;
   }catch(e){ return null; }
 }
 
-async function probeTokenLargestAccounts(pk){
+async function probeTokenLargestAccounts(pk, opts){
   try{
     const cached = tokenLargestCache.get(pk);
     if(cached && (Date.now() - cached.ts) < PROBE_TTL_MS) return cached.val;
-    const val = await withRetries(async ()=> await connection.getTokenLargestAccounts(new PublicKey(pk)).catch(()=>null));
+    const conn = (opts && opts.preferPrivate && rpcPool && typeof rpcPool.getRpcConnection === 'function') ? rpcPool.getRpcConnection({ preferPrivate: true }) : (connection || (rpcPool && rpcPool.getRpcConnection ? rpcPool.getRpcConnection() : null));
+    if(!conn) return null;
+    const val = await withRetries(async ()=> await conn.getTokenLargestAccounts(new PublicKey(pk)).catch(()=>null));
     tokenLargestCache.set(pk, { ts: Date.now(), val });
     return val;
   }catch(e){ return null; }
@@ -140,6 +182,7 @@ class ProgramFSM extends EventEmitter {
     super();
     this.states = new Map(); // mint -> { mask, slot, lastSeenTs }
     this.programs = opts.programs || []; // optional filter of program IDs
+    this.ledger = new LedgerSignalEngine({ windowSlots: (opts && opts.slotWindow) || 3, densityThreshold: (opts && opts.densityThreshold) || 3 });
     this._onEvent = this._onEvent.bind(this);
     this._logSubs = [];
     if(sniper && sniper.notifier && typeof sniper.notifier.on === 'function'){
@@ -256,34 +299,63 @@ class ProgramFSM extends EventEmitter {
 
   _onEvent(ev){
     try{
+      const collectTs = Date.now();
       const program = ev && ev.program;
       if(this.programs.length>0 && !this.programs.includes(program)) return; // optional filter
       const slot = ev && (ev.slot || ev.blockSlot || ev.txBlock || ev.firstBlock || null);
       const fresh = Array.isArray(ev.freshMints) ? ev.freshMints : [];
+      // If event lacks a slot, try to fetch a real slot from a managed RPC (fast, prefer private)
+      (async ()=>{
+        try{
+          if(!slot){
+            try{
+              let conn = null;
+              if(connection) conn = connection;
+              else if(rpcPool && typeof rpcPool.getRpcConnection === 'function') conn = rpcPool.getRpcConnection({ preferPrivate: true });
+              if(conn && typeof conn.getSlot === 'function'){
+                try{
+                  const s = await withTimeout(conn.getSlot(), 200).catch(()=>null);
+                  if(s) ev.slot = s;
+                }catch(_e){}
+              }
+            }catch(_e){}
+          }
+        }catch(_e){}
+        // Feed the ledger signal engine (keeps a tiny ring-buffer of recent slot events)
+        try{ this.ledger.processEvent(ev); }catch(_e){}
+      })();
       for(const m of fresh){
         const s = this._ensure(m, slot);
         // perform deterministic RPC probes asynchronously
         (async ()=>{
+          // attach ledger-derived mask (kept separate to avoid colliding with core FSM bits)
+          try{ const ledgerMask = this.ledger.getMaskForMint(m, slot); if(ledgerMask){ s.ledgerMask = (s.ledgerMask || 0) | ledgerMask; s._ledgerTs = Date.now(); } }catch(_e){}
           await this._probeMintAndUpdate(m, s);
           // emit state update
           this.emit('state', { mint: m, mask: s.mask, slot: s.slot, lastSeen: s.lastSeenTs });
+          try{ // append immediate metric snapshot (may be updated later)
+            metrics.appendMetric({ mint: m, collect_ts: collectTs, ledger_ts: s._ledgerTs || null, final_reprobe_latency_ms: null, triggered: false, ledgerMask: s.ledgerMask || 0, ledgerMaskNames: (s.ledgerMask ? decodeLedgerMask(s.ledgerMask) : []), mask: s.mask, slot: s.slot, score: null });
+          }catch(_e){}
           // if ready and slot matches current event slot -> perform final reprobe then trigger immediate
           if((s.mask & READY_MASK) === READY_MASK && s.slot && slot && Number(s.slot) === Number(slot)){
             try{
               // final quick reprobe for atomicity (reduce race conditions).
               // Run probes in parallel to minimize latency (target <=20ms).
+              let finalReprobeLatency = null;
               try{
                 const t0 = Date.now();
                 // limit each probe to a short timeout to hit micro-latency targets
                 const perProbeMs = (cfg && typeof cfg.FINAL_REPROBE_PER_PROBE_MS !== 'undefined') ? Number(cfg.FINAL_REPROBE_PER_PROBE_MS) : Number(process.env.FINAL_REPROBE_PER_PROBE_MS || 12);
                 const jupiterMs = (cfg && typeof cfg.FINAL_REPROBE_JUPITER_MS !== 'undefined') ? Number(cfg.FINAL_REPROBE_JUPITER_MS) : Number(process.env.FINAL_REPROBE_JUPITER_MS || 18);
                 const [finalAi, finalLa, jq] = await Promise.all([
-                  withTimeout(probeGetAccountInfo(m).catch(()=>null), perProbeMs).catch(()=>null),
-                  withTimeout(probeTokenLargestAccounts(m).catch(()=>null), perProbeMs).catch(()=>null),
+                  withTimeout(probeGetAccountInfo(m, { preferPrivate: true }).catch(()=>null), perProbeMs).catch(()=>null),
+                  withTimeout(probeTokenLargestAccounts(m, { preferPrivate: true }).catch(()=>null), perProbeMs).catch(()=>null),
                   withTimeout(probeJupiterSmallQuote(m).catch(()=>null), jupiterMs).catch(()=>null),
                 ]);
                 const t1 = Date.now();
-                try{ console.error('[FSM] final reprobe latency ms:', (t1 - t0)); }catch(_e){}
+                finalReprobeLatency = (t1 - t0);
+                try{ console.error('[FSM] final reprobe latency ms:', finalReprobeLatency); }catch(_e){}
+                try{ s._lastFinalReprobeLatency = finalReprobeLatency; }catch(_e){}
 
                 if(finalAi){
                   try{
@@ -322,10 +394,27 @@ class ProgramFSM extends EventEmitter {
               for(const [bit, w] of Object.entries(WEIGHTS)){
                 try{ if(s.mask & Number(bit)) score += Number(w); }catch(_e){}
               }
+              // include ledger-derived mask contributions (if present)
+              let ledgerMask = 0;
+              try{ ledgerMask = s.ledgerMask || 0; }catch(_e){ ledgerMask = 0; }
+              try{
+                for(const [bit, w] of Object.entries(LEDGER_WEIGHTS)){
+                  try{ if(ledgerMask & Number(bit)) score += Number(w); }catch(_e){}
+                }
+              }catch(_e){}
+              // ledger strong shortcut: if ledger signals are strong and transferable detected, prefer fire
+              let ledgerStrong = false;
+              try{ ledgerStrong = Boolean(this.ledger && this.ledger.isStrongSignal && this.ledger.isStrongSignal(m, s.slot || slot, 2)); }catch(_e){ ledgerStrong = false; }
+              if(ledgerStrong){
+                try{ console.error('[FSM] ledgerStrong detected for', m, 'ledgerMaskNames=', decodeLedgerMask(ledgerMask)); }catch(_e){}
+              }
 
               // ready if transferable present AND (core bits all present OR score >= threshold)
-                      if(hasTransferable && (coreOk || score >= SCORE_THRESHOLD)){
+                      const triggeredNow = (hasTransferable && (coreOk || score >= SCORE_THRESHOLD)) || (ledgerStrong && hasTransferable);
+                      if(triggeredNow){
                         const trig = { mint: m, slot: s.slot, mask: s.mask, reason: 'ready_mask_matched_in_slot', probes: { simulated: true } };
+                        // attach ledgerMask names for downstream consumers
+                        if(ledgerMask) trig.ledgerMask = ledgerMask; try{ if(ledgerMask) trig.ledgerMaskNames = decodeLedgerMask(ledgerMask); }catch(_e){}
                         this.emit('trigger', trig);
                         console.error('[FSM] SIMULATED trigger for', m, 'mask=', s.mask.toString(2).padStart(8,'0'));
                         // Also emit a standardized notification via sniper.notifier so in-process Telegram bot picks it up.
@@ -344,15 +433,18 @@ class ProgramFSM extends EventEmitter {
                             try{ sniper.notifier.emit('notification', payload); }catch(_e){}
                           }
                         }catch(_e){}
-                try{
+                      try{
                   const st = { token: m, liquidity_usd: 12000, pool_initialized: true, is_transferable: !!(s.mask & BIT_TRANSFERABLE), mint_authority: !!(s.mask & BIT_AUTH_OK), freeze_authority: false, update_authority: false };
                   const execution = sim.pre_slot_analysis(st);
                   try{ execution.trigger(); console.error('⚡ EXECUTION TRIGGERED (simulation)'); }catch(e){ console.error('[FSM] sim trigger error', e); }
                   try{ const clock = new sim.SlotClock(Number(slot)); sim.slot_trigger(clock, Number(slot), execution).then(res=>{ console.error('[FSM] slot_trigger finished', res); }).catch(()=>{}); }catch(e){ console.error('[FSM] slot_trigger start error', e); }
                 }catch(e){ console.error('[FSM] trigger handling error', e); }
+                      // append metric indicating triggered
+                      try{ metrics.appendMetric({ mint: m, collect_ts: collectTs, ledger_ts: s._ledgerTs || null, final_reprobe_latency_ms: finalReprobeLatency, triggered: true, ledgerMask: ledgerMask || 0, ledgerMaskNames: (ledgerMask ? decodeLedgerMask(ledgerMask) : []), mask: s.mask, slot: s.slot, score: score }); }catch(_e){}
               } else {
                 // not ready after final probe
                 this.emit('state', { mint: m, mask: s.mask, slot: s.slot, lastSeen: s.lastSeenTs, note: 'not_ready_after_final_reprobe' });
+                      try{ metrics.appendMetric({ mint: m, collect_ts: collectTs, ledger_ts: s._ledgerTs || null, final_reprobe_latency_ms: finalReprobeLatency, triggered: false, ledgerMask: ledgerMask || 0, ledgerMaskNames: (ledgerMask ? decodeLedgerMask(ledgerMask) : []), mask: s.mask, slot: s.slot, score: score }); }catch(_e){}
               }
             }catch(e){ console.error('[FSM] trigger outer error', e); }
           }
