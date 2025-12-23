@@ -136,6 +136,49 @@ function validateNotificationPayload(payload: any) {
 let users: Record<string, any> = loadUsers();
 logt('--- Users loaded ---');
 
+// Subscribe to in-process notifications emitted by `sniper.js` (collector/listener)
+try{
+  const sniperMod = require('./sniper.js');
+  if(sniperMod && sniperMod.notifier && typeof sniperMod.notifier.on === 'function'){
+    sniperMod.notifier.on('notification', async (payload: any) => {
+      try{
+        const v = validateNotificationPayload(payload);
+        if(!v) return;
+        const uid = v.userId;
+        const chatId = v.chatId;
+        // tokens may be provided directly or embedded in raw payload
+        const tokens = v.tokens || (v.raw && v.raw.tokens) || (v.raw && v.raw.candidateTokens) || [];
+        // If tokens is not an array but a single token object, normalize
+        const tokenArr = Array.isArray(tokens) ? tokens : (tokens ? [tokens] : []);
+        // Prefer existing html payload when present
+        if(v.html){
+          try{
+            await bot.telegram.sendMessage(chatId, v.html, { parse_mode: 'HTML', reply_markup: { inline_keyboard: v.inlineKeyboard || [] } });
+            return;
+          }catch(e){}
+        }
+        // Else build and send token cards for each token (limit to 3)
+        const tk = require('./src/utils/tokenUtils');
+        const botUsername = bot.botInfo?.username || process.env.BOT_USERNAME || 'YourBotUsername';
+        const toSend = tokenArr.slice(0,3);
+        for(const tkn of toSend){
+          try{
+            // annotate message when mergedSignal is present
+            let prefix = '';
+            try{ if(tkn.mergedSignal) prefix = '✅ <b>MergedSignal</b> — live Sollet/Ledger agreement\n\n'; }catch(_e){}
+            const pairAddress = tkn.pairAddress || tkn.tokenAddress || tkn.address || tkn.mint || '';
+            const built = tk.buildTokenMessage(tkn, botUsername, pairAddress, uid);
+            if(built && built.msg){
+              const fullMsg = prefix + built.msg;
+              await bot.telegram.sendMessage(chatId, fullMsg, { parse_mode: 'HTML', disable_web_page_preview: false, reply_markup: { inline_keyboard: built.inlineKeyboard } });
+            }
+          }catch(e){ console.error('sniper->bot send token error', e); }
+        }
+      }catch(e){ }
+    });
+  }
+}catch(e){ console.error('Failed to attach sniper notifier to bot', e && e.message || e); }
+
 // Sent-token hash helpers used by wsListener.ts — simple file-backed store
 import cryptoHash from 'crypto';
 const SENT_HASH_FILE = './sent_tokens/sent_hashes.json';
@@ -1420,8 +1463,12 @@ async function handleSniper(ctx: any, explicitCount?: number) {
       }
       (async () => {
         try {
-          const tokensToHandle = res.slice(0, limit).map((tok: any) => ({ mint: tok.tokenAddress || tok.address || tok.mint || tok.pairAddress || String(tok), createdAt: tok.firstBlockTime || tok.firstBlock || null, __listenerCollected: true }));
-          await autoExecuteStrategyForUser(userObj, tokensToHandle, 'buy', { simulateOnly: true, listenerBypass: true });
+          const tokensToHandle = res.slice(0, limit).map((tok: any) => ({ mint: tok.tokenAddress || tok.address || tok.mint || tok.pairAddress || String(tok), createdAt: tok.firstBlockTime || tok.firstBlock || null, __listenerCollected: true, ledgerMask: tok.ledgerMask, ledgerStrong: tok.ledgerStrong, solletCreatedHere: tok.solletCreatedHere, mergedSignal: tok.mergedSignal }));
+          // Determine whether to perform an immediate live buy: require user opt-in and explicit env enable for safety
+          const userOptIn = !!(userObj && userObj.strategy && userObj.strategy.autoBuy === true);
+          const envAllow = String(process.env.ENABLE_IMMEDIATE_SNIPER_BUY || 'false').toLowerCase() === 'true';
+          const simulateOnly = !(userOptIn && envAllow);
+          await autoExecuteStrategyForUser(userObj, tokensToHandle, 'buy', { simulateOnly, listenerBypass: true });
         } catch (bgErr) { console.error('[Sniper->autoExec background error]', bgErr ? (bgErr instanceof Error ? bgErr.message : String(bgErr)) : 'unknown'); }
       })();
       return;
@@ -1864,6 +1911,37 @@ bot.action(/showtoken_buy_(.+)/, async (ctx) => {
   }
   try {
     const amount = user.strategy.buyAmount || 0.01;
+    // Validate mergedSignal (sollet+ledger) when available to avoid accidental buys
+    try{
+      const sniperMod = require('./sniper.js');
+      const eng = sniperMod && sniperMod.ledgerEngine ? sniperMod.ledgerEngine : null;
+      let mergedOk = false;
+      // first, check in-memory notification queue where listener may have placed the token payload
+      try{
+        const q = (global.__inMemoryNotifQueues && global.__inMemoryNotifQueues.get(String(userId))) || [];
+        if(Array.isArray(q) && q.length>0){
+          for(const payload of q){
+            try{
+              const toks = payload && payload.tokens ? payload.tokens : (payload && payload.event && payload.event.candidateTokens) || payload && payload.candidateTokens;
+              if(!toks) continue;
+              const arr = Array.isArray(toks) ? toks : [toks];
+              for(const tk of arr){ if((tk.tokenAddress||tk.address||tk.mint)===tokenAddress && tk.mergedSignal){ mergedOk = true; break; } }
+              if(mergedOk) break;
+            }catch(_){}
+          }
+        }
+      }catch(_){}
+      // fallback: query ledger engine directly
+      if(!mergedOk && eng && typeof eng.getMaskForMint === 'function'){
+        try{ const ls = eng.isStrongSignal(tokenAddress); if(ls) mergedOk = true; }catch(_e){}
+      }
+      // If not mergedOk, warn user and require explicit confirmation before buying
+      if(!mergedOk){
+        await ctx.reply(`⚠️ Token <code>${tokenAddress}</code> does not have a merged Sollet/Ledger signal (no strong evidence). Reply 'CONFIRM BUY ${tokenAddress}' to proceed.`, { parse_mode: 'HTML' });
+        return;
+      }
+    }catch(_e){ /* ignore validation errors and proceed cautiously */ }
+
     await ctx.reply(`🛒 Buying token: <code>${tokenAddress}</code> with amount: <b>${amount}</b> SOL ...`, { parse_mode: 'HTML' });
     let result: any;
     try {

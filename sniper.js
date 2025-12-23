@@ -19,13 +19,12 @@ function looksLikeUrl(u){ try{ return String(u).toLowerCase().startsWith('http')
 const badKeys = _HELIUS_KEYS.filter(looksLikePlaceholderKey);
 const badUrls = HELIUS_RPC_URLS.filter(u => !looksLikeUrl(u));
 if(badKeys.length > 0 || badUrls.length > 0){
-  console.error('Helius configuration validation failed: please set real API keys and valid RPC URLs via environment variables.');
+  console.error('Helius configuration validation: placeholder-ish API keys or invalid URLs detected.');
   if(badKeys.length>0) console.error('  Detected placeholder-ish HELIUS_API_KEYS:', JSON.stringify(_HELIUS_KEYS));
   if(badUrls.length>0) console.error('  Detected invalid HELIUS_RPC_URLS:', JSON.stringify(HELIUS_RPC_URLS));
   console.error('Example (bash):');
   console.error('  HELIUS_API_KEYS="yourKey1,yourKey2" HELIUS_RPC_URLS="https://mainnet.helius-rpc.com/,https://rpc2.example/" node scripts/sequential_10s_per_program.js');
-  // fail fast so user notices configuration issue instead of silent RPC errors
-  process.exit(1);
+  console.error('Continuing with best-effort mode; collector will log RPC errors but will not exit automatically.');
 }
 const fs = require('fs');
 const path = require('path');
@@ -34,6 +33,43 @@ const EventEmitter = require('events');
 const notifier = new EventEmitter();
 // export notifier when required as a module
 try{ module.exports = module.exports || {}; module.exports.notifier = notifier; }catch(e){}
+// Attach LedgerSignalEngine listener to collect combined metrics (Sollet vs Ledger)
+try{
+  const { LedgerSignalEngine } = require('./src/simulation/ledger_signal_engine');
+  const metrics = require('./src/simulation/fsm_metrics_logger');
+  const eng_bridge = new LedgerSignalEngine({ windowSlots: 5, densityThreshold: 2 });
+  const MASK_NAME_MAP = { 6: 'AccountCreated',7:'ATACreated',8:'SameAuthority',9:'ProgramInit',10:'SlotDensity',11:'LPStruct',12:'CleanFunding',13:'SlotAligned',14:'CreatorExposed' };
+  notifier.on('programEvent', async (ev) => {
+    try{
+      const tx = ev && (ev.transaction || ev.tx || ev.parsedTransaction) || null;
+      const meta = ev && (ev.meta || (tx && tx.meta)) || null;
+      const slot = ev && (ev.slot || (meta && meta.slot) || (tx && tx.slot) || null) || null;
+      const logs = (meta && Array.isArray(meta.logMessages)) ? meta.logMessages.join('\n').toLowerCase() : '';
+      // sollet-style create indicator
+      const solletCreated = !!(logs && (logs.includes('instruction: initializemint') || logs.includes('initialize mint') || logs.includes('initialize_mint') || logs.includes('createidempotent')));
+      // expose sollet detection to downstream consumers and engine
+      try{ ev.solletCreated = !!solletCreated; }catch(_e){}
+      // process via ledger engine (now with ev.solletCreated available)
+      try{ eng_bridge.processEvent(ev); }catch(_e){}
+      const sig = ev && (ev.signature || ev.sig || ev.transaction && ev.transaction.signatures && ev.transaction.signatures[0]) || null;
+      const program = ev && ev.program || null;
+      const fresh = Array.isArray(ev.freshMints) ? ev.freshMints.slice(0,20) : [];
+      for(const m of fresh){
+        try{
+          const mask = eng_bridge.getMaskForMint(m, slot);
+          const strong = eng_bridge.isStrongSignal(m, slot, 2);
+          // derive mask names
+          const names = [];
+          for(let b=6;b<=14;b++){ if(mask & (1<<b)){ const n = MASK_NAME_MAP[b] || null; if(n) names.push(n); } }
+          const metric = { mint: String(m), program, signature: sig, slot: Number(slot||0), mask, maskNames: names, ledgerStrongSignal: !!strong, solletCreatedHere: !!solletCreated, time: new Date().toISOString() };
+          try{ if(metrics && typeof metrics.appendMetric === 'function') metrics.appendMetric(metric); }catch(_e){}
+        }catch(_e){}
+      }
+    }catch(_e){}
+  });
+  // expose ledger engine for other modules (bot) to query masks/signals
+  try{ module.exports = module.exports || {}; module.exports.ledgerEngine = eng_bridge; }catch(e){}
+}catch(e){ console.error('ledger notifier bridge init failed', e && e.message || e); }
 // in-memory per-user notification queues (temporary background memory)
 try{ if(!global.__inMemoryNotifQueues) global.__inMemoryNotifQueues = new Map(); }catch(e){}
 const INMEM_NOTIF_MAX = Number(process.env.NOTIF_INMEM_MAX || 50);
@@ -142,6 +178,16 @@ async function getFirstSignatureCached(mint){
 const RPC_STATS = { calls: 0, errors: 0, rateLimit429: 0, totalLatencyMs: 0 };
 
 function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+
+// Debug helper: write a small debug dump to /tmp for post-mortem when collector skips candidates
+function writeCollectorDebugDump(tag, payload){
+  try{
+    const p = require('path');
+    const out = { tag, ts: new Date().toISOString(), payload };
+    const fn = '/tmp/collector-debug-' + Date.now() + '-' + (tag||'dump') + '.json';
+    try{ fs.writeFileSync(fn, JSON.stringify(out, null, 2), 'utf8'); }catch(e){}
+  }catch(e){}
+}
 
 // heliusRpc(method, params, useEnrich=false)
 // when useEnrich=true the call uses the second Helius key / URL for enrichment work
@@ -382,11 +428,11 @@ async function startSequentialListener(options){
             if(seenTxs.has(sig)) { await sleep(POLL_SLEEP_MS); continue; } seenTxs.add(sig);
             lastSigPerProgram.set(p, sig);
             const tx = await fetchTransaction(sig);
-            if(!tx || tx.__error) { await sleep(POLL_SLEEP_MS); continue; }
+            if(!tx || tx.__error) { console.error('startSequentialListener: fetchTransaction failed or error for sig=', sig, tx && tx.__error); await sleep(POLL_SLEEP_MS); continue; }
             const kind = txKindExplicit(tx); if(!kind) { await sleep(250); continue; }
             // Always process explicit 'initialize' transactions to avoid missing real mint launches
             if(!(rule.allow.includes(kind) || kind === 'initialize')) { await sleep(250); continue; }
-            const mints = extractMints(tx).filter(x=>x && !DENY.has(x)); if(mints.length===0) { await sleep(250); continue; }
+            const mints = extractMints(tx).filter(x=>x && !DENY.has(x)); if(mints.length===0) { console.error('startSequentialListener: no mints extracted for sig=', sig); writeCollectorDebugDump('no-mints', { program: p, sig, kind, sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6) }); await sleep(250); continue; }
             // Fast-path capture-only: write minimal capture immediately and skip enrichment/acceptance heuristics.
             if(CAPTURE_ONLY){
               try{
@@ -485,12 +531,12 @@ async function startSequentialListener(options){
                     }
                   }catch(e){}
                 }
-        if(!referencesFresh){ await sleep(POLL_SLEEP_MS); continue; }
+        if(!referencesFresh){ console.error('startSequentialListener: parsed instrs did not reference fresh mints for sig=', sig, 'fresh=', JSON.stringify(fresh).slice(0,200)); writeCollectorDebugDump('unref', { program: p, sig, fresh, kind }); await sleep(POLL_SLEEP_MS); continue; }
               }catch(e){}
             }
             for(const m of fresh) seenMints.add(m);
             // Emit global event for listeners (no DEX enrichment)
-            const globalEvent = { time:new Date().toISOString(), program:p, signature:sig, kind: kind, freshMints:fresh.slice(0,5), sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6) };
+            const globalEvent = { time:new Date().toISOString(), program:p, signature:sig, kind: kind, freshMints:fresh.slice(0,5), sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6), transaction: (tx && (tx.transaction || tx)) || null, meta: (tx && tx.meta) || null };
             // By default route global events to stderr to avoid polluting stdout (which is reserved
             // for confirmed initialize collector events). Set DEBUG_WS=1 to print full JSON to stdout.
             if (process.env.DEBUG_WS) {
@@ -559,6 +605,27 @@ async function startSequentialListener(options){
                 }catch(e){}
                 return tok;
               }));
+              // Attach ledger-derived mask/flags to candidate tokens when possible
+              try{
+                const eng = module.exports && module.exports.ledgerEngine ? module.exports.ledgerEngine : (typeof eng_bridge !== 'undefined' ? eng_bridge : null);
+                if(eng){
+                  for(const t of candidateTokens){
+                    try{
+                      const mint = t && (t.tokenAddress || t.address || t.mint) || null;
+                      if(!mint) continue;
+                      const mask = eng.getMaskForMint(mint);
+                      const ledgerStrong = eng.isStrongSignal(mint);
+                      t.ledgerMask = mask;
+                      t.ledgerStrong = !!ledgerStrong;
+                      // if sampleLogs contain sollet-style hints, attach sollet flag
+                      const logsStr = (t.sampleLogs && Array.isArray(t.sampleLogs)) ? t.sampleLogs.join('\n').toLowerCase() : (t.sampleLogs || '').toString().toLowerCase();
+                      const solletHere = !!(logsStr && (logsStr.includes('instruction: initializemint') || logsStr.includes('initialize mint') || logsStr.includes('initialize_mint') || logsStr.includes('createidempotent')));
+                      t.solletCreatedHere = !!solletHere;
+                      t.mergedSignal = !!(t.ledgerStrong || t.solletCreatedHere);
+                    }catch(_e){}
+                  }
+                }
+              }catch(_e){}
         for(const uid of Object.keys(usersLocal || {})){
                 try{
           const user = usersLocal[uid];
@@ -732,6 +799,8 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
   const seenMintsLocal = new Set();
   const stopAt = Date.now() + (Number(timeoutMs) || 20000);
   try{
+    // helper: verbose Helius/debug logging (gate via env)
+    const helDebug = (...a) => { try{ if(process && process.env && String(process.env.DEBUG_HELIUS).toLowerCase()==='true'){ console.error(...a); } }catch(e){} };
     for(const p of PROGRAMS){
       if(Date.now() > stopAt) break;
       try{
@@ -742,12 +811,22 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
           const sig = getSig(s); if(!sig) continue;
           const tx = await fetchTransaction(sig);
           if(!tx || tx.__error) continue;
-          const kind = txKindExplicit(tx); if(!kind) continue;
-          // For the strict collector used for explicit mint detection, only consider explicit 'initialize' transactions.
-          if (kind !== 'initialize') continue;
+          // Try to determine kind; if absent, attempt per-mint "created-in-this-tx" fallback
+          let kind = txKindExplicit(tx);
+          const mints = extractMints(tx).filter(x=>x && !DENY.has(x));
+          if(!kind){
+            if(!mints || mints.length===0){ helDebug('collectFreshMints: skipping sig (no kind and no mints)', sig); continue; }
+            // if any mint shows strong created-in-this-tx indicator, treat as initialize
+            let anyCreated = false;
+            for(const mm of mints){ try{ if(isMintCreatedInThisTx(tx, mm)) { anyCreated = true; break; } }catch(e){}
+            }
+            if(anyCreated){ kind = 'initialize'; console.error('collectFreshMints: inferred initialize from created-in-tx for sig=', sig); }
+            else { helDebug('collectFreshMints: skipping sig (no explicit kind and no created-in-tx)', sig); writeCollectorDebugDump('no-kind-no-created', { program: p, sig, sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6) }); continue; }
+          }
+          // For the strict collector used for explicit mint detection, only consider initialize transactions.
+          if (kind !== 'initialize') { helDebug('collectFreshMints: skipping sig (kind != initialize)', sig, 'kind=', kind); continue; }
           const rule = RULES[p] || RULES.default;
           if(!(rule.allow.includes(kind) || kind === 'initialize')) continue;
-          const mints = extractMints(tx).filter(x=>x && !DENY.has(x)); if(mints.length===0) continue;
           const txBlock = (s.blockTime||s.block_time||s.blocktime)||(tx&&tx.blockTime)||null;
             for(const m of mints){
             if(collected.length >= maxCollect) break;
@@ -769,6 +848,9 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
               // Accept when not previously seen (false) or when unknown (null) to avoid dropping true positives
               // during transient RPC failures/rate-limits. Only reject when prevInit === true.
               if(prevInit === false || prevInit === null) accept = true;
+              else {
+                try{ console.error('collectFreshMints: rejecting mint previously seen', m, 'sig=', sig); writeCollectorDebugDump('prevSeen', { program: p, mint: m, sig, txBlock, prev: prevInit }); }catch(e){}
+              }
             }catch(e){}
             if(accept){
               try{
@@ -810,6 +892,21 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
                   sampleLogs: (tx.meta && tx.meta.logMessages || []).slice(0,6),
                   __listenerCollected: true,
                 };
+                try{
+                  // Attach ledger-derived mask and a merged Sollet+Ledger signal for downstream consumers
+                  if(typeof eng_bridge !== 'undefined' && eng_bridge && typeof eng_bridge.getMaskForMint === 'function'){
+                    try{
+                      const mask = eng_bridge.getMaskForMint(m, txBlock);
+                      const ledgerStrong = eng_bridge.isStrongSignal(m, txBlock);
+                      const logsStr = (tok.sampleLogs && Array.isArray(tok.sampleLogs)) ? tok.sampleLogs.join('\n').toLowerCase() : (tok.sampleLogs || '').toString().toLowerCase();
+                      const solletHere = !!(logsStr && (logsStr.includes('instruction: initializemint') || logsStr.includes('initialize mint') || logsStr.includes('initialize_mint') || logsStr.includes('createidempotent')));
+                      tok.ledgerMask = mask;
+                      tok.ledgerStrong = !!ledgerStrong;
+                      tok.solletCreatedHere = !!solletHere;
+                      tok.mergedSignal = !!(ledgerStrong || solletHere);
+                    }catch(_e){}
+                  }
+                }catch(_e){}
                 collected.push(tok);
                 seenMintsLocal.add(m);
               }catch(e){
