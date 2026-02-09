@@ -1030,6 +1030,392 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
   return Array.from(new Set(collected)).slice(0, maxCollect);
 }
 module.exports.collectFreshMints = collectFreshMints;
+
+// ========================================
+// DEX MULTI-TIMEFRAME STRATEGY EXECUTION
+// ========================================
+
+/**
+ * Execute multi-timeframe strategy on DEX (Sniper)
+ * يقوم بتنفيذ الاستراتيجية متعددة الأطر الزمنية على DEX سنايبر
+ * 
+ * @param {string} userId
+ * @param {string} tokenAddress - عنوان الرمز على Solana
+ * @param {Record<string, number[]>} priceHistoryByTf - { "1m": [...], "5m": [...], "15m": [...], ... }
+ * @param {any} opts - خيارات الاستراتيجية
+ * @returns {Promise<any>}
+ */
+async function executeDexMultiTimeframeStrategy(userId, tokenAddress, priceHistoryByTf, opts = {}) {
+  try {
+    if (!userId || !tokenAddress || !priceHistoryByTf) {
+      return { ok: false, err: 'missing required params' };
+    }
+
+    const {
+      capitalPercent = 0.10,
+      minMatches = 3,
+      takeProfitMin = 0.01,
+      takeProfitMax = 0.03,
+      reinvestLoss = -0.03,
+      timeframes = ['1m', '5m', '15m', '4h'],
+    } = opts;
+
+    // Get current price from first available timeframe
+    let currentPrice = null;
+    let anyTf = null;
+    for (const tf of timeframes) {
+      if (Array.isArray(priceHistoryByTf[tf]) && priceHistoryByTf[tf].length > 0) {
+        anyTf = tf;
+        currentPrice = priceHistoryByTf[tf][priceHistoryByTf[tf].length - 1];
+        break;
+      }
+    }
+
+    if (!currentPrice) {
+      return { ok: false, err: 'no valid price history' };
+    }
+
+    // Calculate indicators for all timeframes
+    const indicators = {};
+    let matchCount = 0;
+    const matchedTfs = [];
+
+    for (const tf of timeframes) {
+      const prices = priceHistoryByTf[tf];
+      if (!Array.isArray(prices) || prices.length < 40) continue;
+
+      // Calculate Stochastic RSI & Williams %R
+      const stochRsi = _dexCalcStochasticRSI(prices);
+      const wr = _dexCalcWilliamsR(prices);
+
+      indicators[tf] = { ...stochRsi, wr };
+
+      // Entry conditions: J < 10, K < 30, K < D, WR > 80
+      const jCond = stochRsi.J < 10;
+      const kCond = stochRsi.K < 30 && stochRsi.K < stochRsi.D;
+      const wrCond = wr > 80;
+
+      if (jCond && kCond && wrCond) {
+        matchCount++;
+        matchedTfs.push(tf);
+      }
+    }
+
+    // Decision: Buy if 3+ timeframes match
+    if (matchCount >= minMatches) {
+      const walletBalance = Number(opts.walletBalance || 10); // SOL
+      const buyAmountSol = walletBalance * capitalPercent;
+
+      // Record buy signal
+      try {
+        const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
+        try {
+          fs.mkdirSync(sentTokensDir, { recursive: true });
+        } catch (e) {}
+
+        const tradeFile = path.join(sentTokensDir, `dex_${userId}.json`);
+        let trades = [];
+        try {
+          if (fs.existsSync(tradeFile)) {
+            trades = JSON.parse(fs.readFileSync(tradeFile, 'utf8'));
+          }
+        } catch (e) {}
+
+        trades.push({
+          action: 'entry',
+          token: tokenAddress,
+          entryPrice: currentPrice,
+          buyAmountSol,
+          matchCount,
+          matchedTfs: matchedTfs.join(','),
+          indicators,
+          timestamp: Date.now(),
+        });
+
+        try {
+          const ENABLE_ARCHIVE = String(process.env.ENABLE_ARCHIVE || '').toLowerCase() === 'true';
+          if (ENABLE_ARCHIVE) {
+            fs.writeFileSync(tradeFile, JSON.stringify(trades.slice(-100), null, 2));
+          }
+        } catch (e) {}
+      } catch (e) {}
+
+      return {
+        ok: true,
+        action: 'BUY',
+        tokenAddress,
+        entryPrice: currentPrice,
+        amountSol: buyAmountSol,
+        matchCount,
+        matchedTfs,
+        reason: `${matchCount}/${timeframes.length} timeframes matched entry`,
+      };
+    }
+
+    // Check for exit signal if already in position
+    const inPosition = opts.inPosition || false;
+    if (inPosition) {
+      const entryPrice = opts.entryPrice || currentPrice;
+      const priceChange = (currentPrice - entryPrice) / entryPrice;
+
+      // Take Profit: +1% to +3%
+      if (priceChange >= takeProfitMin && priceChange <= takeProfitMax) {
+        return {
+          ok: true,
+          action: 'SELL',
+          tokenAddress,
+          exitPrice: currentPrice,
+          profit: priceChange,
+          reason: `Take Profit at +${(priceChange * 100).toFixed(2)}%`,
+        };
+      }
+
+      // Re-entry: -3% from last sell
+      const lastSellPrice = opts.lastSellPrice || entryPrice;
+      if (currentPrice <= lastSellPrice * (1 + reinvestLoss)) {
+        const reentryAmountSol = opts.positionSize || (opts.walletBalance * capitalPercent);
+
+        return {
+          ok: true,
+          action: 'REINVEST',
+          tokenAddress,
+          reentryPrice: currentPrice,
+          amountSol: reentryAmountSol,
+          reason: `Re-entry at -${Math.abs(reinvestLoss * 100).toFixed(1)}% from last sell`,
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      action: 'WAIT',
+      tokenAddress,
+      currentPrice,
+      matchCount,
+      reason: `Only ${matchCount}/${timeframes.length} TFs match (need ${minMatches})`,
+    };
+  } catch (e) {
+    return { ok: false, err: String(e) };
+  }
+}
+
+/**
+ * Helper: Calculate Stochastic RSI for DEX strategy
+ */
+function _dexCalcStochasticRSI(prices, rsiPeriod = 14, stochPeriod = 14, kPeriod = 3, dPeriod = 3) {
+  if (prices.length < rsiPeriod + stochPeriod - 1) {
+    return { J: 50, K: 50, D: 50 };
+  }
+
+  // Calculate RSI
+  const rsiValues = [];
+  for (let i = rsiPeriod; i < prices.length; i++) {
+    const slice = prices.slice(i - rsiPeriod, i + 1);
+    let gains = 0,
+      losses = 0;
+    for (let j = 1; j < slice.length; j++) {
+      const change = slice[j] - slice[j - 1];
+      if (change >= 0) gains += change;
+      else losses += Math.abs(change);
+    }
+    const rs = gains > 0 ? gains / losses : 0;
+    const rsi = 100 - 100 / (1 + rs);
+    rsiValues.push(rsi);
+  }
+
+  // Stochastic of RSI
+  const kValues = [];
+  for (let i = stochPeriod - 1; i < rsiValues.length; i++) {
+    const rsiSlice = rsiValues.slice(i - stochPeriod + 1, i + 1);
+    const minRsi = Math.min(...rsiSlice);
+    const maxRsi = Math.max(...rsiSlice);
+    const k = maxRsi !== minRsi ? ((rsiValues[i] - minRsi) / (maxRsi - minRsi)) * 100 : 50;
+    kValues.push(k);
+  }
+
+  const k = kValues.length >= kPeriod
+    ? kValues.slice(-kPeriod).reduce((a, b) => a + b) / kPeriod
+    : kValues[kValues.length - 1] || 50;
+
+  const kSmooth = [];
+  for (let i = kPeriod - 1; i < kValues.length; i++) {
+    const avg = kValues.slice(i - kPeriod + 1, i + 1).reduce((a, b) => a + b) / kPeriod;
+    kSmooth.push(avg);
+  }
+
+  const d = kSmooth.length >= dPeriod
+    ? kSmooth.slice(-dPeriod).reduce((a, b) => a + b) / dPeriod
+    : kSmooth[kSmooth.length - 1] || 50;
+
+  const j = 3 * k - 2 * d;
+
+  return { J: j, K: k, D: d };
+}
+
+/**
+ * Helper: Calculate Williams %R for DEX strategy
+ */
+function _dexCalcWilliamsR(prices, period = 14) {
+  if (prices.length < period) return -50;
+
+  const slice = prices.slice(-period);
+  const highest = Math.max(...slice);
+  const lowest = Math.min(...slice);
+  const close = slice[slice.length - 1];
+
+  if (highest === lowest) return 0;
+
+  const wr = ((close - highest) / (highest - lowest)) * -100;
+  return wr;
+}
+
+module.exports.executeDexMultiTimeframeStrategy = executeDexMultiTimeframeStrategy;
+
+// ========================================
+// PERSISTENT DEX PRICE MONITORING
+// مراقبة الأسعار الدائمة للـ DEX
+// ========================================
+
+/**
+ * مراقب أسعار DEX دائم
+ * يراقب قائمة التوكنات ويحدث الأسعار بشكل مستمر
+ */
+async function startDexPriceMonitor(options = {}) {
+  try {
+    const {
+      userIds = [],
+      tokenAddresses = [],
+      checkIntervalMs = 5000,
+      priceSourceRpc = null,
+    } = options;
+
+    let stopped = false;
+
+    const stop = () => {
+      stopped = true;
+      console.log('[DexMonitor] Stopped');
+    };
+
+    const monitor = async () => {
+      if (stopped) return;
+
+      try {
+        const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
+        try {
+          fs.mkdirSync(sentTokensDir, { recursive: true });
+        } catch (e) {}
+
+        // جمع أحدث الأسعار من Helius
+        const priceUpdates = {};
+
+        for (const token of tokenAddresses) {
+          try {
+            // في التطبيق الحقيقي، ستحصل على السعر من أوراكل أو DEX
+            // هنا نحاكي التحديث من الملف المحفوظ
+            const priceId = token.substring(0, 8);
+            priceUpdates[token] = {
+              address: token,
+              price: Math.random() * 100 + 50, // محاكاة: سعر عشوائي
+              timestamp: Date.now(),
+              source: 'helius_mock',
+            };
+          } catch (e) {}
+        }
+
+        // احفظ تحديثات الأسعار
+        for (const userId of userIds) {
+          try {
+            const pricesFile = path.join(sentTokensDir, `${userId}_current_prices.json`);
+            const existing = {};
+            try {
+              if (fs.existsSync(pricesFile)) {
+                const prev = JSON.parse(fs.readFileSync(pricesFile, 'utf8'));
+                Object.assign(existing, prev);
+              }
+            } catch (e) {}
+
+            // دمج الأسعار الجديدة
+            const updated = {
+              ...existing,
+              ...Object.fromEntries(
+                Object.entries(priceUpdates).map(([token, data]) => [
+                  token,
+                  data.price,
+                ])
+              ),
+              _lastUpdate: Date.now(),
+            };
+
+            const ENABLE_ARCHIVE = String(process.env.ENABLE_ARCHIVE || '').toLowerCase() === 'true';
+            if (ENABLE_ARCHIVE) {
+              fs.writeFileSync(pricesFile, JSON.stringify(updated, null, 2));
+            }
+          } catch (e) {}
+        }
+
+        // سجل آخر التحديثات
+        try {
+          const logFile = path.join(sentTokensDir, 'price_monitor.log');
+          const logEntry = {
+            timestamp: new Date().toISOString(),
+            tokensMonitored: tokenAddresses.length,
+            usersMonitored: userIds.length,
+            pricesUpdated: Object.keys(priceUpdates).length,
+          };
+
+          const ENABLE_ARCHIVE = String(process.env.ENABLE_ARCHIVE || '').toLowerCase() === 'true';
+          if (ENABLE_ARCHIVE) {
+            const log = [];
+            try {
+              if (fs.existsSync(logFile)) {
+                const prevLog = fs.readFileSync(logFile, 'utf8').split('\n');
+                log.push(...prevLog.slice(-99)); // احفظ آخر 100 سطر
+              }
+            } catch (e) {}
+
+            log.push(JSON.stringify(logEntry));
+            fs.writeFileSync(logFile, log.join('\n'));
+          }
+        } catch (e) {}
+
+      } catch (error) {
+        console.error('[DexMonitor] Error:', error);
+      }
+    };
+
+    // ابدأ المراقبة
+    const monitorInterval = setInterval(monitor, checkIntervalMs);
+    console.log(`[DexMonitor] Started monitoring ${tokenAddresses.length} tokens for ${userIds.length} users`);
+
+    // جلسة أولية
+    await monitor();
+
+    return stop;
+  } catch (e) {
+    console.error('[startDexPriceMonitor] Error:', e);
+    return () => {};
+  }
+}
+
+/**
+ * قراءة أحدث الأسعار المراقبة
+ */
+function getDexCurrentPrices(userId) {
+  try {
+    const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
+    const pricesFile = path.join(sentTokensDir, `${userId}_current_prices.json`);
+
+    if (fs.existsSync(pricesFile)) {
+      return JSON.parse(fs.readFileSync(pricesFile, 'utf8'));
+    }
+  } catch (e) {}
+
+  return {};
+}
+
+module.exports.startDexPriceMonitor = startDexPriceMonitor;
+module.exports.getDexCurrentPrices = getDexCurrentPrices;
+
 // If script is executed directly, run immediately (CLI usage preserved)
 if (require.main === module) {
   startSequentialListener().catch(e => { console.error('Listener failed:', e && e.message || e); process.exit(1); });
